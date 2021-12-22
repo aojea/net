@@ -282,10 +282,11 @@ type ClientConn struct {
 	lastActive      time.Time
 	lastIdle        time.Time // time last idle
 	// Settings from peer: (also guarded by wmu)
-	maxFrameSize          uint32
-	maxConcurrentStreams  uint32
-	peerMaxHeaderListSize uint64
-	initialWindowSize     uint32
+	maxFrameSize           uint32
+	maxConcurrentStreams   uint32
+	peerMaxHeaderListSize  uint64
+	initialWindowSize      uint32
+	connectProtocolEnabled bool
 
 	// reqHeaderMu is a 1-element semaphore channel controlling access to sending new requests.
 	// Write to reqHeaderMu to lock it, read from it to unlock.
@@ -824,6 +825,10 @@ type ClientConnState struct {
 	// LastIdle, if non-zero, is when the connection last
 	// transitioned to idle state.
 	LastIdle time.Time
+
+	// ExtendedConnectProtocol reports whether the extended connect protocol
+	// is supported in the connection.
+	ExtendedConnectProtocol bool
 }
 
 // State returns a snapshot of cc's state.
@@ -838,13 +843,14 @@ func (cc *ClientConn) State() ClientConnState {
 	cc.mu.Lock()
 	defer cc.mu.Unlock()
 	return ClientConnState{
-		Closed:               cc.closed,
-		Closing:              cc.closing || cc.singleUse || cc.doNotReuse || cc.goAway != nil,
-		StreamsActive:        len(cc.streams),
-		StreamsReserved:      cc.streamsReserved,
-		StreamsPending:       cc.pendingRequests,
-		LastIdle:             cc.lastIdle,
-		MaxConcurrentStreams: maxConcurrent,
+		Closed:                  cc.closed,
+		Closing:                 cc.closing || cc.singleUse || cc.doNotReuse || cc.goAway != nil,
+		StreamsActive:           len(cc.streams),
+		StreamsReserved:         cc.streamsReserved,
+		StreamsPending:          cc.pendingRequests,
+		LastIdle:                cc.lastIdle,
+		MaxConcurrentStreams:    maxConcurrent,
+		ExtendedConnectProtocol: cc.connectProtocolEnabled,
 	}
 }
 
@@ -1724,7 +1730,10 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 	}
 
 	var path string
-	if req.Method != "CONNECT" {
+	// On requests that contain the :protocol pseudo-header field, the
+	// :scheme and :path pseudo-header fields of the target URI MUST also be included.
+	isExtendedConnect := req.Method == "CONNECT" && cc.connectProtocolEnabled && req.Proto != ""
+	if req.Method != "CONNECT" || isExtendedConnect {
 		path = req.URL.RequestURI()
 		if !validPseudoPath(path) {
 			orig := path
@@ -1765,9 +1774,13 @@ func (cc *ClientConn) encodeHeaders(req *http.Request, addGzipHeader bool, trail
 			m = http.MethodGet
 		}
 		f(":method", m)
-		if req.Method != "CONNECT" {
+		if req.Method != "CONNECT" || isExtendedConnect {
 			f(":path", path)
 			f(":scheme", req.URL.Scheme)
+			if isExtendedConnect {
+				f(":protocol", req.Proto)
+
+			}
 		}
 		if trailers != "" {
 			f("trailer", trailers)
@@ -2706,6 +2719,17 @@ func (rl *clientConnReadLoop) processSettingsNoWrite(f *SettingsFrame) error {
 			cc.cond.Broadcast()
 
 			cc.initialWindowSize = s.Val
+		case SettingEnableConnectProtocol:
+			// A sender MUST NOT send the parameter with the value 0
+			// after previously sending a value 1.
+			if cc.connectProtocolEnabled && s.Val == 0 {
+				return ConnectionError(ErrCodeProtocol)
+			}
+			if s.Val == 1 {
+				cc.connectProtocolEnabled = true
+			} else if s.Val > 1 {
+				return ConnectionError(ErrCodeProtocol)
+			}
 		default:
 			// TODO(bradfitz): handle more settings? SETTINGS_HEADER_TABLE_SIZE probably.
 			cc.vlogf("Unhandled Setting: %v", s)

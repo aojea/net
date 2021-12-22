@@ -44,6 +44,7 @@ func TestSettingString(t *testing.T) {
 	}{
 		{Setting{SettingMaxFrameSize, 123}, "[MAX_FRAME_SIZE = 123]"},
 		{Setting{1<<16 - 1, 123}, "[UNKNOWN_SETTING_65535 = 123]"},
+		{Setting{SettingEnableConnectProtocol, 1}, "[ENABLE_CONNECT_PROTOCOL = 1]"},
 	}
 	for i, tt := range tests {
 		got := fmt.Sprint(tt.s)

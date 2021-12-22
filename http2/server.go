@@ -136,6 +136,10 @@ type Server struct {
 	// The errType consists of only ASCII word characters.
 	CountError func(errType string)
 
+	// EnableConnectProtocol, if true, allows clients to use the Extended
+	// Connect Protocol as defined by RFC 8441.
+	EnableConnectProtocol bool
+
 	// Internal state. This is a pointer (rather than embedded directly)
 	// so that we don't embed a Mutex in this struct, which will make the
 	// struct non-copyable, which might break some callers.
@@ -168,6 +172,13 @@ func (s *Server) maxConcurrentStreams() uint32 {
 		return v
 	}
 	return defaultMaxStreams
+}
+
+func (s *Server) enableConnectProtocol() uint32 {
+	if s.EnableConnectProtocol {
+		return 1
+	}
+	return 0
 }
 
 // maxQueuedControlFrames is the maximum number of control frames like
@@ -383,6 +394,7 @@ func (s *Server) ServeConn(c net.Conn, opts *ServeConnOpts) {
 		headerTableSize:             initialHeaderTableSize,
 		serveG:                      newGoroutineLock(),
 		pushEnabled:                 true,
+		connectProtocolEnabled:      s.enableConnectProtocol(),
 	}
 
 	s.state.registerConn(sc)
@@ -490,24 +502,25 @@ func (sc *serverConn) rejectConn(err ErrCode, debug string) {
 
 type serverConn struct {
 	// Immutable:
-	srv              *Server
-	hs               *http.Server
-	conn             net.Conn
-	bw               *bufferedWriter // writing to conn
-	handler          http.Handler
-	baseCtx          context.Context
-	framer           *Framer
-	doneServing      chan struct{}          // closed when serverConn.serve ends
-	readFrameCh      chan readFrameResult   // written by serverConn.readFrames
-	wantWriteFrameCh chan FrameWriteRequest // from handlers -> serve
-	wroteFrameCh     chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
-	bodyReadCh       chan bodyReadMsg       // from handlers -> serve
-	serveMsgCh       chan interface{}       // misc messages & code to send to / run on the serve loop
-	flow             flow                   // conn-wide (not stream-specific) outbound flow control
-	inflow           flow                   // conn-wide inbound flow control
-	tlsState         *tls.ConnectionState   // shared by all handlers, like net/http
-	remoteAddrStr    string
-	writeSched       WriteScheduler
+	srv                    *Server
+	hs                     *http.Server
+	conn                   net.Conn
+	bw                     *bufferedWriter // writing to conn
+	handler                http.Handler
+	baseCtx                context.Context
+	framer                 *Framer
+	doneServing            chan struct{}          // closed when serverConn.serve ends
+	readFrameCh            chan readFrameResult   // written by serverConn.readFrames
+	wantWriteFrameCh       chan FrameWriteRequest // from handlers -> serve
+	wroteFrameCh           chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
+	bodyReadCh             chan bodyReadMsg       // from handlers -> serve
+	serveMsgCh             chan interface{}       // misc messages & code to send to / run on the serve loop
+	flow                   flow                   // conn-wide (not stream-specific) outbound flow control
+	inflow                 flow                   // conn-wide inbound flow control
+	tlsState               *tls.ConnectionState   // shared by all handlers, like net/http
+	connectProtocolEnabled uint32                 // 0: false 1: true
+	remoteAddrStr          string
+	writeSched             WriteScheduler
 
 	// Everything following is owned by the serve loop; use serveG.check():
 	serveG                      goroutineLock // used to verify funcs are on serve()
@@ -829,6 +842,7 @@ func (sc *serverConn) serve() {
 			{SettingMaxConcurrentStreams, sc.advMaxStreams},
 			{SettingMaxHeaderListSize, sc.maxHeaderListSize()},
 			{SettingInitialWindowSize, uint32(sc.srv.initialStreamRecvWindowSize())},
+			{SettingEnableConnectProtocol, sc.srv.enableConnectProtocol()},
 		},
 	})
 	sc.unackedSettings++
@@ -2012,9 +2026,29 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 		scheme:    f.PseudoValue("scheme"),
 		authority: f.PseudoValue("authority"),
 		path:      f.PseudoValue("path"),
+		protocol:  f.PseudoValue("protocol"),
 	}
 
 	isConnect := rp.method == "CONNECT"
+	isExtendedConnect := rp.protocol != ""
+	// Extended Connect Protocol RFC 8441
+	if isExtendedConnect {
+		// If a client were to use the provisions of the extended CONNECT
+		// method without first receiving a SETTINGS_ENABLE_CONNECT_PROTOCOL
+		// parameter, a non-supporting peer would detect a malformed
+		// request and generate a stream error.
+		if !sc.srv.EnableConnectProtocol {
+			return nil, nil, sc.countError("bad_protocol_method", streamError(f.StreamID, ErrCodeProtocol))
+		}
+		// :protocol contains a value from "Hypertext Transfer Protocol (HTTP) Upgrade Token Registry"
+		// https://www.iana.org/assignments/http-upgrade-tokens/http-upgrade-tokens.xhtml
+		switch rp.protocol {
+		case "TLS", "HTTP", "WebSocket", "websocket", "h2c":
+		default:
+			return nil, nil, sc.countError("bad_protocol_method", streamError(f.StreamID, ErrCodeProtocol))
+		}
+	}
+
 	if isConnect {
 		if rp.path != "" || rp.scheme != "" || rp.authority == "" {
 			return nil, nil, sc.countError("bad_connect", streamError(f.StreamID, ErrCodeProtocol))
@@ -2071,6 +2105,7 @@ func (sc *serverConn) newWriterAndRequest(st *stream, f *MetaHeadersFrame) (*res
 type requestParam struct {
 	method                  string
 	scheme, authority, path string
+	protocol                string
 	header                  http.Header
 }
 
@@ -2112,9 +2147,17 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp requestParam) (*r
 
 	var url_ *url.URL
 	var requestURI string
+	protocol := "HTTP/2.0"
 	if rp.method == "CONNECT" {
+		// On requests bearing the :protocol pseudo-header field, the
+		// :authority pseudo-header field is interpreted according to
+		// Section 8.1.2.3 of [RFC7540] instead of Section 8.3 of that
+		// document.
 		url_ = &url.URL{Host: rp.authority}
 		requestURI = rp.authority // mimic HTTP/1 server behavior
+		if rp.protocol != "" {
+			protocol = rp.protocol
+		}
 	} else {
 		var err error
 		url_, err = url.ParseRequestURI(rp.path)
@@ -2135,7 +2178,7 @@ func (sc *serverConn) newWriterAndRequestNoBody(st *stream, rp requestParam) (*r
 		RemoteAddr: sc.remoteAddrStr,
 		Header:     rp.header,
 		RequestURI: requestURI,
-		Proto:      "HTTP/2.0",
+		Proto:      protocol,
 		ProtoMajor: 2,
 		ProtoMinor: 0,
 		TLS:        tlsState,
